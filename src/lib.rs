@@ -1,6 +1,5 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::{atomic::AtomicBool, OnceLock};
 
-use once_cell::sync::OnceCell;
 use tauri::{
     async_runtime,
     plugin::{Builder, TauriPlugin},
@@ -11,16 +10,17 @@ use tauri::{
 mod android;
 mod commands;
 mod error;
+mod event_handlers;
 mod handler;
 pub mod models;
 
 pub use error::Error;
+pub use event_handlers::{OnDisconnectHandler, SubscriptionHandler};
 pub use handler::Handler;
-pub use handler::{OnDisconnectHandler, SubscriptionHandler};
 
 pub static ALLOW_IBEACONS: AtomicBool = AtomicBool::new(false);
 
-static HANDLER: OnceCell<Handler> = OnceCell::new();
+static HANDLER: OnceLock<Handler> = OnceLock::new();
 
 pub fn try_init() -> Result<TauriPlugin<Wry>, Error> {
     let handler = async_runtime::block_on(Handler::new())?;

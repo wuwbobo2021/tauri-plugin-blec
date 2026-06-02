@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use btleplug::api::BDAddr;
-use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -41,46 +39,49 @@ impl PartialEq for BleDevice {
     }
 }
 
-#[async_trait::async_trait]
-pub trait BondingPeripheral: btleplug::api::Peripheral {
-    async fn is_bonded(&self) -> Result<bool, btleplug::Error> {
-        Err(btleplug::Error::NotSupported(
-            "Bonding is not implemented in btleplug".to_string(),
-        ))
-    }
-}
-
-// Default implementation for btleplug
-#[cfg(not(target_os = "android"))]
-impl<P: btleplug::api::Peripheral> BondingPeripheral for P {}
-
 impl BleDevice {
-    pub(crate) async fn from_peripheral<P: BondingPeripheral>(
-        peripheral: &P,
+    pub(crate) async fn from_bluest(
+        adv_dev: &bluest::AdvertisingDevice,
     ) -> Result<Self, error::Error> {
-        #[cfg(target_vendor = "apple")]
-        let address = peripheral.id().to_string();
-        #[cfg(not(target_vendor = "apple"))]
-        let address = peripheral.address().to_string();
-        let properties = peripheral.properties().await?.unwrap_or_default();
-        let name = properties
+        let adv_data = adv_dev.adv_data.clone();
+        let address = adv_dev.device.id().to_string();
+        let name = adv_dev
+            .adv_data
             .local_name
-            .unwrap_or_else(|| peripheral.id().to_string());
+            .clone()
+            .unwrap_or_else(|| adv_dev.device.id().to_string());
+        let mut manufacturer_data = HashMap::new();
+        if let Some(man_data) = adv_data.manufacturer_data {
+            manufacturer_data.insert(man_data.company_id, man_data.data);
+        }
+        let is_connected = adv_dev.device.is_connected().await;
+        let rssi = if is_connected {
+            adv_dev.device.rssi().await.ok()
+        } else {
+            adv_dev.rssi
+        };
+        let is_bonded = adv_dev.device.is_paired().await?;
         Ok(Self {
             address,
             name,
-            manufacturer_data: properties.manufacturer_data,
-            service_data: properties.service_data,
-            services: properties.services,
-            rssi: properties.rssi,
-            is_connected: peripheral.is_connected().await?,
-            #[cfg(target_os = "android")]
-            is_bonded: peripheral.is_bonded().await?,
-            #[cfg(not(target_os = "android"))]
-            is_bonded: false,
-            tx_power_level: properties.tx_power_level,
+            manufacturer_data,
+            service_data: adv_data.service_data,
+            services: adv_data.services,
+            rssi,
+            is_connected,
+            is_bonded,
+            tx_power_level: adv_data.tx_power_level,
         })
     }
+}
+
+pub async fn build_service_model(device: &bluest::Device) -> Result<Vec<Service>, error::Error> {
+    let mut service_models = Vec::new();
+    for service in device.services().await? {
+        let service = Service::from_bluest(&service).await?;
+        service_models.push(service);
+    }
+    Ok(service_models)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -89,16 +90,16 @@ pub struct Service {
     pub characteristics: Vec<Characteristic>,
 }
 
-impl From<&btleplug::api::Service> for Service {
-    fn from(service: &btleplug::api::Service) -> Self {
-        Self {
-            uuid: service.uuid,
-            characteristics: service
-                .characteristics
-                .iter()
-                .map(Characteristic::from)
-                .collect(),
+impl Service {
+    pub(crate) async fn from_bluest(service: &bluest::Service) -> Result<Self, error::Error> {
+        let mut characteristics = Vec::new();
+        for char in service.characteristics().await? {
+            characteristics.push(Characteristic::from_bluest(&char).await?);
         }
+        Ok(Self {
+            uuid: service.uuid(),
+            characteristics,
+        })
     }
 }
 
@@ -106,21 +107,27 @@ impl From<&btleplug::api::Service> for Service {
 pub struct Characteristic {
     pub uuid: Uuid,
     pub descriptors: Vec<Uuid>,
-    pub properties: BitFlags<CharProps>,
+    pub properties: CharProps,
 }
 
-impl From<&btleplug::api::Characteristic> for Characteristic {
-    fn from(characteristic: &btleplug::api::Characteristic) -> Self {
-        Self {
-            uuid: characteristic.uuid,
-            descriptors: characteristic.descriptors.iter().map(|d| d.uuid).collect(),
-            properties: get_flags(characteristic.properties),
-        }
+impl Characteristic {
+    pub(crate) async fn from_bluest(
+        characteristic: &bluest::Characteristic,
+    ) -> Result<Self, error::Error> {
+        Ok(Self {
+            uuid: characteristic.uuid(),
+            descriptors: characteristic
+                .descriptors()
+                .await?
+                .iter()
+                .map(|d| d.uuid())
+                .collect(),
+            properties: characteristic.properties().await?.into(),
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[enumflags2::bitflags]
 #[repr(u8)]
 pub enum CharProps {
     Broadcast,
@@ -133,39 +140,28 @@ pub enum CharProps {
     ExtendedProperties,
 }
 
-impl From<btleplug::api::CharPropFlags> for CharProps {
-    fn from(flag: btleplug::api::CharPropFlags) -> Self {
-        match flag {
-            btleplug::api::CharPropFlags::BROADCAST => CharProps::Broadcast,
-            btleplug::api::CharPropFlags::READ => CharProps::Read,
-            btleplug::api::CharPropFlags::WRITE_WITHOUT_RESPONSE => CharProps::WriteWithoutResponse,
-            btleplug::api::CharPropFlags::WRITE => CharProps::Write,
-            btleplug::api::CharPropFlags::NOTIFY => CharProps::Notify,
-            btleplug::api::CharPropFlags::INDICATE => CharProps::Indicate,
-            btleplug::api::CharPropFlags::AUTHENTICATED_SIGNED_WRITES => {
-                CharProps::AuthenticatedSignedWrites
-            }
-            btleplug::api::CharPropFlags::EXTENDED_PROPERTIES => CharProps::ExtendedProperties,
-            _ => unreachable!(),
+impl From<bluest::CharacteristicProperties> for CharProps {
+    fn from(flag: bluest::CharacteristicProperties) -> Self {
+        if flag.broadcast {
+            CharProps::Broadcast
+        } else if flag.read {
+            CharProps::Read
+        } else if flag.write_without_response {
+            CharProps::WriteWithoutResponse
+        } else if flag.write {
+            CharProps::Write
+        } else if flag.notify {
+            CharProps::Notify
+        } else if flag.indicate {
+            CharProps::Indicate
+        } else if flag.authenticated_signed_writes {
+            CharProps::AuthenticatedSignedWrites
+        } else if flag.extended_properties {
+            CharProps::ExtendedProperties
+        } else {
+            unreachable!()
         }
     }
-}
-
-fn get_flags(properties: btleplug::api::CharPropFlags) -> BitFlags<CharProps, u8> {
-    let mut flags = BitFlags::empty();
-    for flag in properties.iter() {
-        flags |= CharProps::from(flag);
-    }
-    flags
-}
-
-#[must_use]
-pub fn fmt_addr(addr: BDAddr) -> String {
-    let a = addr.into_inner();
-    format!(
-        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        a[0], a[1], a[2], a[3], a[4], a[5]
-    )
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -175,15 +171,6 @@ pub enum WriteType {
     WithResponse,
     /// aka command.
     WithoutResponse,
-}
-
-impl From<WriteType> for btleplug::api::WriteType {
-    fn from(write_type: WriteType) -> Self {
-        match write_type {
-            WriteType::WithResponse => btleplug::api::WriteType::WithResponse,
-            WriteType::WithoutResponse => btleplug::api::WriteType::WithoutResponse,
-        }
-    }
 }
 
 /// Filter for discovering devices.
