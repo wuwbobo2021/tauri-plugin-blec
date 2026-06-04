@@ -4,8 +4,8 @@ use tokio::sync::mpsc::error::SendError;
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("Btleplug error: {0}")]
-    Btleplug(#[from] bluest::Error),
+    #[error("Bluest error: {0}")]
+    Bluest(#[from] bluest::Error),
 
     #[error("There is no peripheral with id: {0}")]
     UnknownPeripheral(String),

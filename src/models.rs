@@ -52,6 +52,7 @@ impl BleDevice {
             .unwrap_or_else(|| adv_dev.device.id().to_string());
         let mut manufacturer_data = HashMap::new();
         if let Some(man_data) = adv_data.manufacturer_data {
+            // NOTE: only one item. this is the limitation of `bluest` 0.6.x.
             manufacturer_data.insert(man_data.company_id, man_data.data);
         }
         let is_connected = adv_dev.device.is_connected().await;
@@ -78,7 +79,13 @@ impl BleDevice {
 pub async fn build_service_model(device: &bluest::Device) -> Result<Vec<Service>, error::Error> {
     let mut service_models = Vec::new();
     for service in device.services().await? {
-        let service = Service::from_bluest(&service).await?;
+        let service = match Service::from_bluest(&service).await {
+            Ok(serv) => serv,
+            Err(error::Error::Bluest(e)) if e.kind() == bluest::error::ErrorKind::NotAuthorized => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         service_models.push(service);
     }
     Ok(service_models)

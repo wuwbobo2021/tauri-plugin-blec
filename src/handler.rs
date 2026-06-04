@@ -61,13 +61,13 @@ impl Connection {
 
     /// Discover services and refresh `services` and `characs`, without GATT operation lock.
     async fn discover_services(&mut self) -> Result<(), Error> {
-        debug!("starting service discovery");
+        info!("starting service discovery");
         run_with_timeout(
             self.connected_dev.device.discover_services(),
             "discover services",
         )
         .await?;
-        debug!("service discovery done");
+        info!("service discovery done");
         self.refresh_services_characs().await?;
         Ok(())
     }
@@ -79,7 +79,14 @@ impl Connection {
         let services = models::build_service_model(device).await?;
         let mut characs = vec![];
         for s in device.services().await? {
-            for c in s.characteristics().await? {
+            let chars = match s.characteristics().await {
+                Ok(chars) => chars,
+                Err(e) if e.kind() == bluest::error::ErrorKind::NotAuthorized => {
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            for c in chars {
                 characs.push(c);
             }
         }
@@ -107,16 +114,16 @@ impl Connection {
         let charac = self.characs.iter().find(|c| c.uuid() == uuid);
         charac.ok_or(Error::CharacNotAvailable(uuid.to_string()))
     }
-}
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        for (_, handle) in self.notify_listeners.blocking_lock().drain() {
+    async fn on_disconnect(&mut self) {
+        let listeners: Vec<_> = self.notify_listeners.lock().await.drain().collect();
+        for (_, handle) in listeners {
             handle.abort();
         }
         if let Some(handle) = self.device_event_handle.take() {
             handle.abort();
         }
+        self.on_disconnect.take().run().await;
     }
 }
 
@@ -287,7 +294,7 @@ impl Handler {
         // connect to the given address, try up to 3 times before returning an error
 
         let discovered = self.lookup_device(address).await?;
-        let _conn_guard = self.connect_op_lock.lock().await;
+        let _conn_op_guard = self.connect_op_lock.lock().await;
 
         let device = discovered.device.clone();
         let conn_event_hdl =
@@ -329,6 +336,7 @@ impl Handler {
     async fn connect_internal(&self, device: &Device) -> Result<(), Error> {
         trace!("connect_device: initiating connection to {}", device.id());
         debug!("connecting to {}", device.id());
+        #[cfg(not(target_os = "windows"))]
         let mut connected_rx = self.connected_rx.clone();
         {
             if device.is_connected().await {
@@ -345,18 +353,21 @@ impl Handler {
             let _gatt_guard = self.gatt_op_lock.lock().await;
             run_with_timeout(adapter.connect_device(device), "Connect").await?;
         }
-        // wait for the actual connection to be established
-        if !*connected_rx.borrow_and_update() {
-            info!("waiting for connection event");
-            connected_rx
-                .changed()
-                .await
-                .expect("failed to wait for connection event");
-        }
-        if !*self.connected_rx.borrow() {
-            // still not connected
-            warn!("Still not connected after connection event");
-            return Err(Error::ConnectionFailed);
+        #[cfg(not(target_os = "windows"))]
+        if !device.is_connected().await {
+            // wait for the actual connection to be established
+            if !*connected_rx.borrow_and_update() {
+                info!("waiting for connection event");
+                connected_rx
+                    .changed()
+                    .await
+                    .expect("failed to wait for connection event");
+            }
+            if !*self.connected_rx.borrow() {
+                // still not connected
+                warn!("Still not connected after connection event");
+                return Err(Error::ConnectionFailed);
+            }
         }
         trace!("connect_device: connection established to {}", device.id());
         info!("device connected");
@@ -370,27 +381,25 @@ impl Handler {
     /// # Panics
     /// Panics if there is an error with handling the internal disconnect event.
     pub async fn disconnect(&self) -> Result<(), Error> {
-        trace!("disconnect: user-initiated disconnect");
-        info!("disconnect triggered by user");
         let mut connected_rx = self.connected_rx.clone();
-
         let dev = self.require_connected_device().await?;
-        let _conn_guard = self.connect_op_lock.lock().await;
 
-        if dev.is_connected().await {
-            assert!(
-                (*connected_rx.borrow_and_update()),
-                "connected_rx is false with a device being connected, this is a bug"
-            );
-            let adapter = self.get_or_init_adapter().await?;
-            adapter.disconnect_device(&dev).await?;
-        } else {
+        let _conn_op_guard = self.connect_op_lock.lock().await;
+
+        if !dev.is_connected().await {
             debug!("device is not connected");
             return Err(Error::NoDeviceConnected);
         }
 
-        // the change will be triggered by handle_event -> handle_disconnect which runs in another
-        // task
+        info!("performing disconnection");
+        assert!(
+            (*connected_rx.borrow_and_update()),
+            "connected_rx is false with a device being connected, this is a bug"
+        );
+        let adapter = self.get_or_init_adapter().await?;
+        adapter.disconnect_device(&dev).await?;
+
+        // the change will be triggered by handle_event -> handle_disconnect which runs in another task
         connected_rx
             .changed()
             .await
@@ -412,6 +421,10 @@ impl Handler {
                 return;
             }
         };
+        info!(
+            "connection_event_handler: started event listening for {}",
+            device.id()
+        );
         while let Some(ev) = conn_events.next().await {
             match ev {
                 ConnectionEvent::Connected => {
@@ -422,9 +435,12 @@ impl Handler {
                 }
             }
         }
+        info!(
+            "connection_event_handler: event stream for {} exhausted",
+            device.id()
+        );
     }
 
-    #[allow(clippy::redundant_closure_for_method_calls)]
     async fn handle_connect(&self, peripheral_id: DeviceId) {
         if let Some(connected_device) = self.connected_device_id().await {
             if connected_device == peripheral_id {
@@ -459,7 +475,7 @@ impl Handler {
             info!("disconnecting");
             let conn = self.connection.lock().await.take();
             if let Some(mut conn) = conn {
-                conn.on_disconnect.take().run().await;
+                conn.on_disconnect().await;
             }
         }
         self.send_connection_update(false).await;
@@ -469,8 +485,6 @@ impl Handler {
         Ok(())
     }
 
-    // XXX: with `bluest`, new devices are always discovered one by one,
-    // there could be `Sender<BleDevice>` instead of `Sender<Vec<BleDevice>>`.
     /// Scans for `timeout` milliseconds and periodically sends discovered devices
     /// to the given channel.
     ///
@@ -534,7 +548,12 @@ impl Handler {
         filter: ScanFilter,
     ) {
         let handler = crate::get_handler().unwrap();
-        let mut scan_stream = match adapter.scan(&[]).await {
+        let service_id_filter = match &filter {
+            ScanFilter::Service(id) => &[id.clone()],
+            ScanFilter::AnyService(ids) => ids.as_slice(),
+            _ => &[],
+        };
+        let mut scan_stream = match adapter.scan(service_id_filter).await {
             Ok(stream) => {
                 let _ = tx_init_signal.send(Ok(()));
                 stream
@@ -548,6 +567,7 @@ impl Handler {
         self_devices.lock().await.clear();
         handler.send_scan_update(true).await;
         let t_timeout = Instant::now() + Duration::from_millis(timeout);
+        let mut disc_ble_devs = HashMap::new();
         loop {
             let scan_next = async {
                 scan_stream
@@ -561,24 +581,29 @@ impl Handler {
             let Ok(discovered) = run_with_given_timeout(scan_next, timeout, "scan").await else {
                 break;
             };
+            if !filter_device(&discovered, &filter) {
+                continue;
+            }
+
             let Ok(ble_device) = BleDevice::from_bluest(&discovered).await else {
                 error!("`BleDevice::from_bluest` failed in scan process");
                 continue;
             };
             let id = discovered.device.id().to_string();
-            if filter_device(&discovered, &filter) {
-                // refreshes advertisement data even if the device with `id` is previously known.
-                self_devices.lock().await.insert(id, discovered);
-            }
+
+            // refreshes advertisement data even if the device with `id` is previously discovered.
+            self_devices.lock().await.insert(id.clone(), discovered);
             if let Some(tx) = &tx {
-                tx.send(vec![ble_device])
-                    .await
-                    .expect("failed to send devices");
+                disc_ble_devs.insert(id, ble_device);
+                let mut ble_devs: Vec<_> = disc_ble_devs.clone().into_values().collect();
+                ble_devs.sort();
+                tx.send(ble_devs).await.expect("failed to send devices");
             }
         }
         // the scanning is stopped in the drop glue of the `bluest` stream implementation.
         drop(scan_stream);
         handler.send_scan_update(false).await;
+
         info!("`discover_handler` ended");
     }
 
@@ -589,7 +614,6 @@ impl Handler {
     /// If the device with `address` is not connected, a connection is made in order to discover
     /// the services and characteristics. If some other device was previously connected, it is
     /// disconnected. After the service discovery is done, the device with `address` is disconnected.
-    ///
     ///
     /// # Errors
     /// Returns an error if the device is not found, if the connection fails, or if the discovery fails.
@@ -623,7 +647,8 @@ impl Handler {
     /// adapter scan is stopped (best-effort — it may have already been
     /// stopped by the polling task finishing).
     pub async fn stop_scan(&self) -> Result<(), Error> {
-        if let Some(handle) = self.scan_state.lock().await.scan_task.take() {
+        let scan_handle = self.scan_state.lock().await.scan_task.take();
+        if let Some(handle) = scan_handle {
             handle.abort();
             self.send_scan_update(false).await;
         }
@@ -864,7 +889,7 @@ async fn run_with_timeout<T: Send>(
     cmd: &str,
 ) -> Result<T, Error> {
     run_with_given_timeout(
-        async { fut.await.map_err(Error::Btleplug) },
+        async { fut.await.map_err(Error::Bluest) },
         Duration::from_secs(5),
         cmd,
     )
