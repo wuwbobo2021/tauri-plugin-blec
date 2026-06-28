@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -76,45 +77,17 @@ impl BleDevice {
     }
 }
 
-pub async fn build_service_model(device: &bluest::Device) -> Result<Vec<Service>, error::Error> {
-    let mut service_models = Vec::new();
-    for service in device.services().await? {
-        let service = match Service::from_bluest(&service).await {
-            Ok(serv) => serv,
-            Err(error::Error::Bluest(e)) if e.kind() == bluest::error::ErrorKind::NotAuthorized => {
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        service_models.push(service);
-    }
-    Ok(service_models)
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Service {
     pub uuid: Uuid,
     pub characteristics: Vec<Characteristic>,
 }
 
-impl Service {
-    pub(crate) async fn from_bluest(service: &bluest::Service) -> Result<Self, error::Error> {
-        let mut characteristics = Vec::new();
-        for char in service.characteristics().await? {
-            characteristics.push(Characteristic::from_bluest(&char).await?);
-        }
-        Ok(Self {
-            uuid: service.uuid(),
-            characteristics,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Characteristic {
     pub uuid: Uuid,
     pub descriptors: Vec<Uuid>,
-    pub properties: CharProps,
+    pub properties: BitFlags<CharProps>,
 }
 
 impl Characteristic {
@@ -129,12 +102,13 @@ impl Characteristic {
                 .iter()
                 .map(|d| d.uuid())
                 .collect(),
-            properties: characteristic.properties().await?.into(),
+            properties: get_flags(characteristic.properties().await?),
         })
     }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[enumflags2::bitflags]
 #[repr(u8)]
 pub enum CharProps {
     Broadcast,
@@ -147,28 +121,8 @@ pub enum CharProps {
     ExtendedProperties,
 }
 
-impl From<bluest::CharacteristicProperties> for CharProps {
-    fn from(flag: bluest::CharacteristicProperties) -> Self {
-        if flag.broadcast {
-            CharProps::Broadcast
-        } else if flag.read {
-            CharProps::Read
-        } else if flag.write_without_response {
-            CharProps::WriteWithoutResponse
-        } else if flag.write {
-            CharProps::Write
-        } else if flag.notify {
-            CharProps::Notify
-        } else if flag.indicate {
-            CharProps::Indicate
-        } else if flag.authenticated_signed_writes {
-            CharProps::AuthenticatedSignedWrites
-        } else if flag.extended_properties {
-            CharProps::ExtendedProperties
-        } else {
-            unreachable!()
-        }
-    }
+fn get_flags(properties: bluest::CharacteristicProperties) -> BitFlags<CharProps, u8> {
+    BitFlags::from_bits_truncate(properties.to_bits() as u8)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

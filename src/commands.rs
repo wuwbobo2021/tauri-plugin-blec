@@ -163,7 +163,7 @@ pub(crate) async fn recv_string<R: Runtime>(
     service: Option<Uuid>,
 ) -> Result<String> {
     let data = recv(app, characteristic, service).await?;
-    Ok(String::from_utf8(data).expect("failed to convert data to string"))
+    Ok(String::from_utf8_lossy(&data).into_owned())
 }
 
 async fn subscribe_channel(
@@ -171,7 +171,7 @@ async fn subscribe_channel(
     service: Option<Uuid>,
 ) -> Result<mpsc::Receiver<Vec<u8>>> {
     let handler = get_handler()?;
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = tokio::sync::mpsc::channel(512);
     handler
         .subscribe(characteristic, service, move |data: Vec<u8>| {
             info!("subscribe_channel: {:?}", data);
@@ -210,7 +210,7 @@ pub(crate) async fn subscribe_string<R: Runtime>(
     async_runtime::spawn(async move {
         while let Some(data) = rx.recv().await {
             info!("subscribe_string: {:?}", data);
-            let data = String::from_utf8(data).expect("failed to convert data to string");
+            let data = String::from_utf8_lossy(&data).into_owned();
             on_data
                 .send(data)
                 .expect("failed to send data to the front-end");

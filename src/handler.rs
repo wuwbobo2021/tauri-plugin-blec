@@ -46,51 +46,98 @@ struct Connection {
 }
 
 impl Connection {
-    pub(crate) async fn build(connected_dev: DiscoveredDevice) -> Result<Self, Error> {
-        let mut conn = Self {
+    pub(crate) fn new(connected_dev: DiscoveredDevice) -> Self {
+        Self {
             connected_dev,
             services: Vec::new(),
             characs: Vec::new(),
             notify_listeners: Arc::new(Mutex::new(HashMap::new())),
             device_event_handle: None,
             on_disconnect: OnDisconnectHandler::None,
-        };
-        conn.refresh_services_characs().await?;
-        Ok(conn)
-    }
-
-    /// Discover services and refresh `services` and `characs`, without GATT operation lock.
-    async fn discover_services(&mut self) -> Result<(), Error> {
-        info!("starting service discovery");
-        run_with_timeout(
-            self.connected_dev.device.discover_services(),
-            "discover services",
-        )
-        .await?;
-        info!("service discovery done");
-        self.refresh_services_characs().await?;
-        Ok(())
+        }
     }
 
     /// Refreshes `services` and `characs` with the known information from the
     /// underlying `bluest` API, without performing service discovery.
+    ///
+    /// The caller should consider locking the `gatt_op_lock`.
     async fn refresh_services_characs(&mut self) -> Result<(), Error> {
         let device = &self.connected_dev.device;
-        let services = models::build_service_model(device).await?;
-        let mut characs = vec![];
+
+        // NOTE: on Windows, it is possible to lose characteristics of some being-used services after
+        // service discovery because of "access denied": <https://github.com/alexmoon/bluest/issues/47>.
+        // Even if `self.characs` is cleared here, there may be notify listeners holding characteristic
+        // handlers. This is a partial workaround.
+        #[cfg(target_os = "windows")]
+        let mut busy_services: Vec<(models::Service, Vec<Characteristic>)> = {
+            let listening_charac_ids: Vec<_> = {
+                let listeners = self.notify_listeners.lock().await;
+                listeners
+                    .iter()
+                    .filter(|l| !l.1.is_finished())
+                    .map(|l| *l.0)
+                    .collect()
+            };
+            self.services
+                .drain(..)
+                .filter(|sm| {
+                    sm.characteristics
+                        .iter()
+                        .any(|cm| listening_charac_ids.contains(&cm.uuid))
+                })
+                .map(|sm| {
+                    let chars = sm
+                        .characteristics
+                        .iter()
+                        .filter_map(|cm| {
+                            self.characs
+                                .iter()
+                                .find(|charac| charac.uuid() == cm.uuid)
+                                .cloned()
+                        })
+                        .collect();
+                    (sm, chars)
+                })
+                .collect()
+        };
+
+        self.services.clear();
+        self.characs.clear();
+
+        let mut service_models = Vec::new();
+        let mut characs = Vec::new();
         for s in device.services().await? {
+            #[cfg(target_os = "windows")]
+            if let Some(mut serv) = busy_services
+                .extract_if(.., |serv| serv.0.uuid == s.uuid())
+                .next()
+            {
+                service_models.push(serv.0);
+                characs.append(&mut serv.1);
+            }
+
+            let mut char_models = Vec::new();
             let chars = match s.characteristics().await {
                 Ok(chars) => chars,
                 Err(e) if e.kind() == bluest::error::ErrorKind::NotAuthorized => {
+                    warn!(
+                        "failed to get characteristics of service {}: not authorized",
+                        s.uuid()
+                    );
                     continue;
                 }
                 Err(e) => return Err(e.into()),
             };
             for c in chars {
+                char_models.push(models::Characteristic::from_bluest(&c).await?);
                 characs.push(c);
             }
+            service_models.push(models::Service {
+                uuid: s.uuid(),
+                characteristics: char_models,
+            });
         }
-        self.services = services;
+        self.services = service_models;
         self.characs = characs;
         Ok(())
     }
@@ -108,8 +155,6 @@ impl Connection {
                 .iter()
                 .find(|c| c.uuid == uuid)
                 .ok_or(Error::CharacNotAvailable(uuid.to_string()))?;
-        } else {
-            info!("getting characteristic {uuid}");
         }
         let charac = self.characs.iter().find(|c| c.uuid() == uuid);
         charac.ok_or(Error::CharacNotAvailable(uuid.to_string()))
@@ -285,6 +330,15 @@ impl Handler {
         on_disconnect: OnDisconnectHandler,
         allow_ibeacons: bool,
     ) -> Result<(), Error> {
+        let connected_dev = self.get_connected_device().await;
+        if let Some(dev) = connected_dev {
+            if dev.id().to_string().contains(address) {
+                return Ok(()); // do not reconnect to the same device
+            } else {
+                self.disconnect().await?;
+            }
+        }
+
         if self.known_devices.lock().await.is_empty() {
             self.discover(None, 1000, ScanFilter::None, allow_ibeacons)
                 .await?;
@@ -320,11 +374,8 @@ impl Handler {
             return Err(e);
         }
 
-        let mut conn = Connection::build(discovered.clone()).await?;
-        {
-            let _gatt_guard = self.gatt_op_lock.lock().await;
-            conn.discover_services().await?;
-        }
+        let mut conn = Connection::new(discovered.clone());
+        conn.refresh_services_characs().await?;
         conn.on_disconnect = on_disconnect;
         conn.device_event_handle = Some(conn_event_hdl);
         self.connection.lock().await.replace(conn);
@@ -380,7 +431,9 @@ impl Handler {
     /// Returns an error if no device is connected or if the disconnect fails.
     /// # Panics
     /// Panics if there is an error with handling the internal disconnect event.
+    #[allow(unreachable_code)]
     pub async fn disconnect(&self) -> Result<(), Error> {
+        #[allow(unused)]
         let mut connected_rx = self.connected_rx.clone();
         let dev = self.require_connected_device().await?;
 
@@ -392,6 +445,15 @@ impl Handler {
         }
 
         info!("performing disconnection");
+        #[cfg(target_os = "windows")]
+        {
+            // See platform-specific note of `bluest::Adapter::disconnect_device`.
+            let dev_id = dev.id();
+            self.known_devices.lock().await.remove(&dev_id.to_string());
+            drop(dev);
+            self.handle_disconnect(dev_id).await?;
+            return Ok(());
+        }
         assert!(
             (*connected_rx.borrow_and_update()),
             "connected_rx is false with a device being connected, this is a bug"
@@ -549,11 +611,11 @@ impl Handler {
     ) {
         let handler = crate::get_handler().unwrap();
         let service_id_filter = match &filter {
-            ScanFilter::Service(id) => &[id.clone()],
-            ScanFilter::AnyService(ids) => ids.as_slice(),
-            _ => &[],
+            ScanFilter::Service(id) => vec![*id],
+            ScanFilter::AnyService(ids) => ids.clone(),
+            _ => Vec::new(),
         };
-        let mut scan_stream = match adapter.scan(service_id_filter).await {
+        let mut scan_stream = match adapter.scan(&service_id_filter).await {
             Ok(stream) => {
                 let _ = tx_init_signal.send(Ok(()));
                 stream
@@ -564,10 +626,47 @@ impl Handler {
                 return;
             }
         };
+
         self_devices.lock().await.clear();
+
+        let (tx_disc, mut rx_disc) = mpsc::unbounded_channel();
+        tokio::task::spawn(async move {
+            let mut disc_ble_devs = HashMap::new();
+            let mut t_next_send = Instant::now();
+            while let Some(discovered) = rx_disc.recv().await {
+                if !filter_device(&discovered, &filter) {
+                    continue;
+                }
+
+                let Ok(ble_device) = BleDevice::from_bluest(&discovered).await else {
+                    error!("`BleDevice::from_bluest` failed in scan process");
+                    continue;
+                };
+                let id = discovered.device.id().to_string();
+
+                // refreshes advertisement data even if the device with `id` is previously discovered.
+                self_devices.lock().await.insert(id.clone(), discovered);
+                if let Some(tx) = &tx {
+                    disc_ble_devs.insert(id, ble_device);
+                    if Instant::now() < t_next_send {
+                        continue;
+                    }
+                    let mut ble_devs: Vec<_> = disc_ble_devs.clone().into_values().collect();
+                    ble_devs.sort();
+                    let _ = tx.try_send(ble_devs);
+                    t_next_send += Duration::from_millis(200);
+                }
+            }
+
+            if let Some(tx) = &tx {
+                let mut ble_devs: Vec<_> = disc_ble_devs.clone().into_values().collect();
+                ble_devs.sort();
+                tx.send(ble_devs).await.expect("failed to send devices");
+            }
+        });
+
         handler.send_scan_update(true).await;
         let t_timeout = Instant::now() + Duration::from_millis(timeout);
-        let mut disc_ble_devs = HashMap::new();
         loop {
             let scan_next = async {
                 scan_stream
@@ -581,27 +680,11 @@ impl Handler {
             let Ok(discovered) = run_with_given_timeout(scan_next, timeout, "scan").await else {
                 break;
             };
-            if !filter_device(&discovered, &filter) {
-                continue;
-            }
-
-            let Ok(ble_device) = BleDevice::from_bluest(&discovered).await else {
-                error!("`BleDevice::from_bluest` failed in scan process");
-                continue;
-            };
-            let id = discovered.device.id().to_string();
-
-            // refreshes advertisement data even if the device with `id` is previously discovered.
-            self_devices.lock().await.insert(id.clone(), discovered);
-            if let Some(tx) = &tx {
-                disc_ble_devs.insert(id, ble_device);
-                let mut ble_devs: Vec<_> = disc_ble_devs.clone().into_values().collect();
-                ble_devs.sort();
-                tx.send(ble_devs).await.expect("failed to send devices");
-            }
+            let _ = tx_disc.send(discovered);
         }
         // the scanning is stopped in the drop glue of the `bluest` stream implementation.
         drop(scan_stream);
+        drop(tx_disc); // closes the single-device stream
         handler.send_scan_update(false).await;
 
         info!("`discover_handler` ended");
@@ -624,20 +707,30 @@ impl Handler {
         let prev_connected_dev = self.get_connected_device().await;
         if let Some(device) = prev_connected_dev.as_ref() {
             if address == device.id().to_string() {
-                // XXX: should service discovery be performed again?
-                return models::build_service_model(device).await;
+                info!("starting service discovery");
+                let _gatt_guard = self.gatt_op_lock.lock().await;
+                run_with_timeout(device.discover_services(), "discover services").await?;
+                info!("service discovery done");
+                if let Some(conn) = self.connection.lock().await.as_mut() {
+                    conn.refresh_services_characs().await?;
+                    return Ok(conn.services.clone());
+                }
             }
         }
-        let device = self.lookup_device(address).await?;
         if let Err(e) = self.connect(address, OnDisconnectHandler::None, true).await {
             error!("Failed to connect for service discovery: {e}");
             return Err(e);
         }
-        let result = models::build_service_model(&device.device).await;
+        let result = self
+            .connection
+            .lock()
+            .await
+            .as_ref()
+            .map(|c| c.services.clone());
         if let Err(e) = self.disconnect().await {
             error!("Failed to disconnect after service discovery: {e}");
         }
-        result
+        result.ok_or(Error::NoDeviceConnected)
     }
 
     /// Stops scanning for devices.
@@ -759,10 +852,14 @@ impl Handler {
         rx_init.await.unwrap()?;
         let conn_guard = self.connection.lock().await;
         if let Some(conn) = conn_guard.as_ref() {
-            conn.notify_listeners
+            if let Some(prev_listener) = conn
+                .notify_listeners
                 .lock()
                 .await
-                .insert(char_id, listen_handle);
+                .insert(char_id, listen_handle)
+            {
+                prev_listener.abort();
+            }
             Ok(())
         } else {
             Err(Error::NoDeviceConnected)
@@ -819,7 +916,9 @@ impl Handler {
     pub async fn unsubscribe(&self, c: Uuid) -> Result<(), Error> {
         let conn_guard = self.connection.lock().await;
         if let Some(conn) = conn_guard.as_ref() {
-            let _ = conn.notify_listeners.lock().await.remove(&c);
+            if let Some(listener) = conn.notify_listeners.lock().await.remove(&c) {
+                listener.abort();
+            }
             Ok(())
         } else {
             Err(Error::NoDeviceConnected)
