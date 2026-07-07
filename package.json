@@ -1,6 +1,6 @@
 {
   "name": "@mnlphlp/plugin-blec",
-  "version": "0.9.0",
+  "version": "0.13.0-beta.0",
   "author": "Manuel Philipp",
   "description": "JS Bindings for BLE-Client plugin for Tauri",
   "license": "(MIT OR Apache-2.0)",
@@ -23,7 +23,7 @@
     "pretest": "yarn build"
   },
   "dependencies": {
-    "@tauri-apps/api": ">=2.0.0-beta.6"
+    "@tauri-apps/api": "^2"
   },
   "devDependencies": {
     "@rollup/plugin-typescript": "^11.1.6",
@@ -31,6 +31,5 @@
     "tslib": "^2.6.2",
     "typedoc": "^0.26.11",
     "typescript": "^5.3.3"
-  },
-  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+  }
 }
