@@ -1,232 +1,117 @@
 package com.plugin.blec
-
-
-import Peripheral
+ 
+import android.Manifest
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
-import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
-import java.util.UUID
-
-
-@InvokeArg
-class ConnectParams{
-    val address: String = ""
-}
-
+ 
 @TauriPlugin
-class BleClientPlugin(private val activity: Activity): Plugin(activity) {
-    var devices: MutableMap<String, Peripheral> = mutableMapOf();
-    var connected_devices: MutableMap<String, Peripheral> = mutableMapOf();
-    var eventChannel: Channel? = null;
-    private val client = BleClient(activity,this)
-    
+class BleClientPlugin(activity: Activity) : Plugin(activity) {
+    private val permChecker: PermissionChecker = PermissionChecker(activity, this)
+    private val appContext: Context = activity.applicationContext
+ 
     @Command
-    fun clear_devices(invoke: Invoke){
-        this.devices.clear()
+    fun init_ndk_context(invoke: Invoke) {
+        native_init_ndk_context(appContext)
         invoke.resolve()
     }
-
-    @Command
-    fun start_scan(invoke: Invoke) {
-        client.startScan(invoke)
+ 
+    private external fun native_init_ndk_context(context: Context)
+ 
+    @InvokeArg
+    class CheckPermissionsParams {
+        var allowIbeacons: Boolean = false
+        var askIfDenied: Boolean = false
     }
-
+ 
     @Command
-    fun stop_scan(invoke: Invoke){
-        client.stopScan(invoke)
+    fun check_permissions(invoke: Invoke) {
+        val args: CheckPermissionsParams = invoke.parseArgs(CheckPermissionsParams::class.java)
+        val granted: Boolean = permChecker.checkPermissions(args.allowIbeacons, args.askIfDenied)
+        val ret = JSObject()
+        ret.put("result", granted)
+        invoke.resolve(ret)
     }
-
-    @Command
-    fun events(invoke: Invoke){
-        this.eventChannel = invoke.parseArgs(Channel::class.java)
-        invoke.resolve()
+}
+ 
+class PermissionChecker(
+    private val activity: Activity,
+    private val plugin: BleClientPlugin
+) {
+    companion object {
+        private const val PREFS_PERMISSION_FIRST_TIME_ASKING =
+            "com.plugin.blec.PREFS_PERMISSION_FIRST_TIME_ASKING"
     }
-
-    @Command
-    fun connect(invoke: Invoke){
-        val args = invoke.parseArgs(ConnectParams::class.java)
-        val device = this.devices[args.address]
-        if (device == null){
-            invoke.reject("connect: device '${args.address}' not found in discovered devices (known: ${this.devices.keys})")
-            return
-        }
-        this.connected_devices[args.address] = device;
-        device.connect(invoke)
+ 
+    private fun markFirstPermissionRequest(perm: String) {
+        val sharedPreference: SharedPreferences = activity.getSharedPreferences(
+            PREFS_PERMISSION_FIRST_TIME_ASKING,
+            Context.MODE_PRIVATE
+        )
+        sharedPreference.edit().putBoolean(perm, false).apply()
     }
-
-    @Command
-    fun disconnect(invoke: Invoke){
-        val args = invoke.parseArgs(ConnectParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("disconnect: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        this.connected_devices.remove(args.address)
-        device.disconnect(invoke)
+ 
+    private fun firstPermissionRequest(perm: String): Boolean {
+        return activity.getSharedPreferences(PREFS_PERMISSION_FIRST_TIME_ASKING, Context.MODE_PRIVATE)
+            .getBoolean(perm, true)
     }
-
-    @Command
-    fun is_connected(invoke: Invoke){
-        val args = invoke.parseArgs(ConnectParams::class.java)
-        val device = this.connected_devices[args.address]
-        val res = JSObject()
-        if (device == null){
-            res.put("result", false)
+ 
+    fun checkPermissions(allowIbeacons: Boolean, askIfDenied: Boolean): Boolean {
+        var permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            )
         } else {
-            res.put("result",device.isConnected())
+            arrayOf(
+                Manifest.permission.BLUETOOTH_ADMIN,
+                Manifest.permission.BLUETOOTH,
+            )
         }
-        invoke.resolve(res)
-    }
-
-    @Command
-    fun is_bonded(invoke: Invoke){
-        val args = invoke.parseArgs(ConnectParams::class.java)
-        val device = this.devices[args.address]
-        val res = JSObject()
-        if (device == null){
-            res.put("result", false)
-        } else {
-            res.put("result", device.isBonded())
+        if (allowIbeacons) {
+            permissions += Manifest.permission.ACCESS_FINE_LOCATION
         }
-        invoke.resolve(res)
-    }
-
-    @Command
-    fun discover_services(invoke:Invoke){
-        val args = invoke.parseArgs(ConnectParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("discover_services: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
+ 
+        for (perm in permissions) {
+            if (ActivityCompat.checkSelfPermission(activity, perm)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                if (firstPermissionRequest(perm)
+                    || activity.shouldShowRequestPermissionRationale(perm)
+                ) {
+                    // this will open the permission dialog
+                    markFirstPermissionRequest(perm)
+                    activity.requestPermissions(permissions, 1)
+                    return false
+                } else {
+                    if (!askIfDenied) {
+                        return false
+                    }
+ 
+                    // this will open settings which asks for permission
+                    val intent = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + activity.packageName)
+                    )
+                    activity.startActivity(intent)
+                    Toast.makeText(activity, "Allow Permission: $perm", Toast.LENGTH_SHORT).show()
+                    return false
+                }
+            }
         }
-        device.discoverServices(invoke)
-    }
-
-    @Command
-    fun services(invoke:Invoke){
-        val args = invoke.parseArgs(ConnectParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("services: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.services(invoke)
-    }
-
-    @InvokeArg
-    class NotifyParams () {
-        var address: String = ""
-        var channel: Channel? = null
-    }
-
-    @Command
-    fun notifications(invoke:Invoke){
-        val args = invoke.parseArgs(NotifyParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("notifications: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.setNotifyChannel(args.channel!!)
-        invoke.resolve()
-    }
-
-    @InvokeArg
-    class WriteParams() {
-        val address: String = ""
-        val characteristic: UUID? = null
-        val service: UUID? = null
-        val data: ByteArray? = null
-        val withResponse: Boolean = true
-    }
-    @Command
-    fun write(invoke:Invoke){
-        val args = invoke.parseArgs(WriteParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("write: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.write(invoke)
-    }
-
-    @InvokeArg
-    class ReadParams(){
-        val address: String = ""
-        val characteristic: UUID? = null
-        val service: UUID? = null
-    }
-    @Command
-    fun read(invoke: Invoke){
-        val args = invoke.parseArgs(ReadParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("read: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.read(invoke)
-    }
-
-    @Command
-    fun subscribe(invoke: Invoke){
-        val args = invoke.parseArgs(ReadParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("subscribe: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.subscribe(invoke,true)
-    }
-
-    @Command
-    fun unsubscribe(invoke: Invoke){
-        val args = invoke.parseArgs(ReadParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("unsubscribe: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.subscribe(invoke,false)
-    }
-
-    @InvokeArg
-    class CheckPermissionsParams(){
-        val allowIbeacons: Boolean = false
-        val askIfDenied: Boolean = false
-    }
-    @Command
-    fun check_permissions(invoke: Invoke){
-        val args = invoke.parseArgs(CheckPermissionsParams::class.java)
-        val granted = client.checkPermissions(args.allowIbeacons, args.askIfDenied);
-        val ret = JSObject();
-        ret.put("result",granted)
-        invoke.resolve(ret);
-    }
-
-    @InvokeArg
-    class MtuParams(){
-        val address: String = ""
-        val mtu: Int = 517
-    }
-    @Command
-    fun request_mtu(invoke: Invoke){
-        val args = invoke.parseArgs(MtuParams::class.java)
-        val device = this.connected_devices[args.address]
-        if (device == null){
-            invoke.reject("request_mtu: device '${args.address}' not in connected devices (connected: ${this.connected_devices.keys})")
-            return
-        }
-        device.requestMtu(invoke, args.mtu)
-    }
-
-    @Command
-    fun adapter_state(invoke: Invoke){
-        client.adapterState(invoke);
+        return true
     }
 }

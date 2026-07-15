@@ -387,17 +387,18 @@ impl Handler {
     async fn connect_internal(&self, device: &Device) -> Result<(), Error> {
         trace!("connect_device: initiating connection to {}", device.id());
         debug!("connecting to {}", device.id());
+
         #[cfg(not(target_os = "windows"))]
         let mut connected_rx = self.connected_rx.clone();
-        {
-            if device.is_connected().await {
-                debug!("Device already connected");
-                self.connected_tx
-                    .send(true)
-                    .expect("failed to send connected update");
-                return Ok(());
-            }
+
+        if device.is_connected().await {
+            debug!("Device already connected");
+            self.connected_tx
+                .send(true)
+                .expect("failed to send connected update");
+            return Ok(());
         }
+
         debug!("Connecting to device");
         {
             let adapter = self.get_or_init_adapter().await?;
@@ -431,7 +432,6 @@ impl Handler {
     /// Returns an error if no device is connected or if the disconnect fails.
     /// # Panics
     /// Panics if there is an error with handling the internal disconnect event.
-    #[allow(unreachable_code)]
     pub async fn disconnect(&self) -> Result<(), Error> {
         #[allow(unused)]
         let mut connected_rx = self.connected_rx.clone();
@@ -452,25 +452,28 @@ impl Handler {
             self.known_devices.lock().await.remove(&dev_id.to_string());
             drop(dev);
             self.handle_disconnect(dev_id).await?;
-            return Ok(());
+            Ok(())
         }
-        assert!(
-            (*connected_rx.borrow_and_update()),
-            "connected_rx is false with a device being connected, this is a bug"
-        );
-        let adapter = self.get_or_init_adapter().await?;
-        adapter.disconnect_device(&dev).await?;
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                (*connected_rx.borrow_and_update()),
+                "connected_rx is false with a device being connected, this is a bug"
+            );
+            let adapter = self.get_or_init_adapter().await?;
+            adapter.disconnect_device(&dev).await?;
 
-        // the change will be triggered by handle_event -> handle_disconnect which runs in another task
-        connected_rx
-            .changed()
-            .await
-            .expect("failed to wait for disconnect event");
-        if *self.connected_rx.borrow() {
-            // still connected
-            return Err(Error::DisconnectFailed);
+            // the change will be triggered by handle_event -> handle_disconnect which runs in another task
+            connected_rx
+                .wait_for(|val| !*val)
+                .await
+                .expect("failed to wait for disconnect event");
+            if *self.connected_rx.borrow() {
+                // still connected
+                return Err(Error::DisconnectFailed);
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     async fn connection_event_handler(device: Device) {
@@ -504,23 +507,12 @@ impl Handler {
     }
 
     async fn handle_connect(&self, peripheral_id: DeviceId) {
-        if let Some(connected_device) = self.connected_device_id().await {
-            if connected_device == peripheral_id {
-                trace!("handle_connect: DeviceConnected event for {peripheral_id}");
-                debug!("connection to {peripheral_id} established");
-                self.connected_tx
-                    .send(true)
-                    .expect("failed to send connected update");
-                debug!("connected_tx updated");
-            } else {
-                // event not for currently connected device, ignore
-                warn!("Unexpected connect event for device {peripheral_id}, connected device is {connected_device}");
-            }
-        } else {
-            warn!(
-                "connect event for device {peripheral_id} received without waiting for connection"
-            );
-        }
+        trace!("handle_connect: DeviceConnected event for {peripheral_id}");
+        debug!("connection to {peripheral_id} established");
+        self.connected_tx
+            .send(true)
+            .expect("failed to send connected update");
+        debug!("connected_tx updated");
     }
 
     /// Clears internal state, updates connected flag and calls disconnect callback
