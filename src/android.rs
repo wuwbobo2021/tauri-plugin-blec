@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use jni_min_helper::try_init_ndk_context;
 use tauri::{plugin::PluginHandle, AppHandle, Wry};
 
 static HANDLE: OnceLock<PluginHandle<Wry>> = OnceLock::new();
@@ -64,27 +65,6 @@ fn native_init_ndk_context_handler<'local>(
     _this: BleClientPlugin<'local>,
     context: AndroidContext<'local>,
 ) -> Result<(), jni::errors::Error> {
-    let init_needed = !do_and_forget_panic(|| {
-        let _ = ndk_context::android_context();
-    });
-    if init_needed {
-        let vm = env.get_java_vm()?.get_raw() as _;
-        let ctx = env.new_global_ref(&context)?.into_raw() as _;
-        if do_and_forget_panic(|| unsafe {
-            ndk_context::initialize_android_context(vm, ctx);
-        }) {
-            tracing::info!("`ndk_context` is initialized by `tauri-plugin-blec`.")
-        }
-    }
-    Ok(())
-}
-
-fn do_and_forget_panic(f: impl FnOnce() + std::panic::UnwindSafe) -> bool {
-    let res = std::panic::catch_unwind(f);
-    if res.is_err() {
-        std::mem::forget(res);
-        false
-    } else {
-        true
-    }
+    tracing::info!("entered `native_init_ndk_context_handler`");
+    unsafe { try_init_ndk_context(env, &context).map(|_| ()) }
 }
